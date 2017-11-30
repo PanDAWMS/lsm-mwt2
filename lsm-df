@@ -1,0 +1,282 @@
+#!/usr/bin/env python
+
+# lsm-df: Report the space availability of a space token
+# 
+# lsm-df [-p protocol] [-t token] endpoint
+#
+# lsm-df [--protocol protocol] [--token token] endpoint
+
+# Valid transport protocols are
+#
+#  GFAL_srm	SRM using gfal-xattr
+#  LCG_srm	SRM using lcg-stmd
+#  Default	Always return 1TB freespace
+#
+#
+####################################################################################################
+
+
+import sys, os, stat, time
+import optparse
+
+from lsm       import *
+import lsm
+
+
+# Transfer protocols which are available to use
+tpAvailable  = [ 'GFAL_srm', 'LCG_srm', 'Default' ]
+
+# Default list of protocols to use
+DEFtpList    = [ 'GFAL_srm' ]
+
+# Default free space in bytes (1TB)
+DEFfreespace = 1024*1024*1024*1024
+
+
+# Transfer protocol commands
+tpCMD = {}
+
+
+# The LSM logfile
+lsm.LOGFILE       = '/var/log/lsm/lsm-df.log'
+
+
+####################################################################################################
+
+
+# Initialize
+token        = None
+protocol     = None
+
+
+# Announce the command we were invoked with
+info(  1,'lsm-df %s invoked as: %s' % ( lsmversion, ' '.join(sys.argv)) )
+
+usage = "Usage: %prog [--protocol protocol][--token token] endpoint"
+parser = optparse.OptionParser(usage)
+parser.add_option("-p",  "--protocol",  action="append",     type="string",  dest="Protocol",
+                  help="Protocol")
+parser.add_option("-t",  "--token",     action="store",      type="string",  dest="Token",
+                  help="Space Token")
+parser.add_option("-v", "--verbose",    action="store_true", dest="Verbose",
+                  help="Turn on verbosity")
+(options, args) = parser.parse_args()
+
+
+
+# Get the verbosity
+verbose = options.Verbose
+
+if ( verbose ) : info( 11," Verbosity enabled")
+
+
+# Fetch the Protocol list
+if ( options.Protocol == None ) :
+  tpList = DEFtpList
+else :
+  tpList = options.Protocol
+
+# Initialze the transport protocol command list to None
+for tp in tpList :
+  if (tp in tpAvailable) : 
+    tpCMD[tp] = [ None, None ]
+  else :
+    error(210,"Invalid command, unknown transport protocol specified: %s" % tp)
+    exitToPilot(210)
+
+
+# Fetch the Space Token name
+if ( options.Token == None ) :
+  token  = None
+  tpList = 'Default'
+else :
+  token  = options.Token
+
+
+# Make certain we only have a storage endpoint
+if ( len(args) != 1 ) :
+  error(212, "Invalid command, a single storage endpoint must be specified")
+  exitToPilot(212)
+
+
+####################################################################################################
+
+
+# Split out the SRC
+src_url = args[0]
+
+# We are expecting a string of the form (srm: can also be httpg:)
+#
+#	srm:://hostname:port/srm/managerv2
+#	srm:://hostname:port/srm/managerv2?SFN=
+#	srm:://hostname:port/srm/v2/server
+#	srm:://hostname:port/srm/v2/server?SFN=
+
+
+# Extract the protocol such as 'srm:' or 'httpg:'
+if   ( src_url.startswith('srm://')   ) :
+  src_protocol = 'srm:'
+elif ( src_url.startswith('httpg://') ) :
+  src_protocol = 'httpg:'
+else :
+  error(213,"Invalid command, SRC must begin with 'srm:// or httpg://'")
+  exitToPilot(213)
+
+
+info( 2,"Transfer protocol: %s" % src_protocol.split(':')[0])
+
+
+# Remove the protocol from the path to get the service path (and remove the SFN=)
+src_service = src_url[len(src_protocol):].split('?')[0]
+
+
+
+# Build the source strings for each protocol
+gfalsrmSRC         = "srm:%s?SFN= 'spacetoken.description?%s'"  % ( src_service, token )
+lcgsrmSRC          = "httpg:%s?SFN= -s %s"                      % ( src_service, token )
+
+
+# Make certain all timeout values are integers and force a round up to the nearest second
+tmoConnect         = int( tmoConnect  + 0.99 )
+tmoTransfer        = int( tmoTransfer + 0.99 )
+tmoTotal           = int( tmoConnect + tmoTransfer )
+tmoCMD             = int( tmoConnect + tmoTransfer )
+
+# TMO for GFAL transfers
+gfalsrmTMO_Total   = int( tmoTotal    )
+gfalsrmTMO_CMD     = int( tmoTotal    )
+
+# TMO for LCG transfers
+lcgsrmTMO_Connect  = int( tmoConnect  )
+lcgsrmTMO_SRM      = int( tmoTransfer )
+lcgsrmTMO_Transfer = int( tmoTransfer )
+lcgsrmTMO_CMD      = int( tmoTransfer )
+
+
+####################################################################################################
+
+
+# The transfer command for each transfer protocol
+defaultCMD = 'echo "[{ \"totalsize\": \"%s\", \"unusedsize\": \"%s\" ]"'                              % ( DEFfreespace, DEFfreespace )
+gfalsrmCMD = 'gfal-xattr --timeout %s %s'                                                             % ( gfalsrmTMO_Total, gfalsrmSRC)
+lcgsrmCMD  = 'lcg-stmd --nobdii --connect-timeout %s --srm-timeout %s --sendreceive-timeout %s -e %s' % ( lcgsrmTMO_Connect, lcgsrmTMO_SRM, lcgsrmTMO_Transfer, lcgsrmSRC )
+
+
+# Default
+tpCMD['Default']    = [ defaultCMD, 15 ]
+
+# GFAL2 using SRM protocol
+tpCMD['GFAL_srm'] = [ gfalsrmCMD, gfalsrmTMO_CMD ]
+
+# LCG using SRM protocol
+tpCMD['LCG_srm']   = [ lcgsrmCMD, lcgsrmTMO_CMD ]
+
+
+# Start with a failure
+exit_status = 255
+
+# Try to transfer the protocol using every protocol listed
+for tp in tpList :
+
+  # Extract the pcache and transfer command from the ntuple
+  tpC = tpCMD[tp][0]
+  tpT = tpCMD[tp][1]
+
+  # Do we have both a pcache and transfer command
+  if ( (tpC == None) ) :
+    warn( 56, "Ignoring transfer protocol %s because there is no available command" % ( tp ) )
+  else :
+
+    info(  2, "Transfer protocol: %s" % tp)
+    info(  7, "Transfer command : %s" % tpC)
+
+    # Initialize the ES Payload
+    esPayload['protocol']    = tp
+    esPayload['command']     = tpC
+
+    if ( token == None ) :
+      esPayload['token']     = 'None'
+    else :
+      esPayload['token']     = token
+      
+    esPayload['start']       = datetime.utcnow().isoformat()
+
+
+    # If default, use the quick step
+    if ( tp == 'Default' ) :
+      exit_status  = 0
+
+    else :
+      # Attempt the transfer with a timeout
+      exit_status, cmd_output = RunCMD(tpC, tpT)
+
+    # Stop the timer for ES
+    esPayload['end'] = datetime.utcnow().isoformat()
+
+    if ( exit_status == 0 ) :
+
+      # Extract the available space by protocol
+      if   ( tp == 'GFAL_srm' ) :
+        DF           = eval(cmd_output)[0]
+        dfTotalSize  = int(DF['totalsize'])
+        dfUnusedSize = int(DF['unusedsize'])
+
+      elif ( tp == 'LCG_srm' ) :
+        DF = {}
+        for df in cmd_output.split('\n') :
+          x, y = df.split(':')
+          DF[x] = y
+        dfTotalSize  = int(DF['  - Total Size'])
+        dfUnusedSize = int(DF['  - Unused Size'])
+
+      elif ( tp == 'Default' ) :
+        dfTotalSize  = DEFfreespace
+        dfUnusedSize = DEFfreespace
+
+      else :
+        dfTotalSize  = DEFfreespace
+        dfUnusedSize = DEFfreespace
+
+
+
+      # Convert bytes to megabytes
+      dfMB = dfUnusedSize / (1024*1024)
+
+      info(  9,"Spacetoken %s has %sMB free space" % ( token, dfMB ) )
+
+      # Finish the ES payload and send to Kibana
+      esPayload['status']     = 'Success'
+      esPayload['freespace']  = int(dfMB * 1024 * 1024)
+
+      # Send payload to ES
+      sendToES('df')
+
+      info(  0,"Transfer command was successful")
+
+      break
+
+    else :
+
+      warn( 50, "Transfer command failed with exit status %s" % exit_status)
+
+      # Finish the ES payload and send to Kibana
+      esPayload['status']     = 'Fail'
+      esPayload['error']      = 'Transport protocol status: %s' % exit_status
+      esPayload['freespace']  = int(0)
+
+      # Send payload to ES
+      sendToES('df')
+
+
+
+# Did we get any free space
+if ( exit_status > 0 ) : 
+  error(255, "All transfer commands failed")
+  exitToPilot(255)
+
+
+# Print the unused space in MB
+print dfMB
+
+# Exit with the Pilot return code
+exitToPilot(0)

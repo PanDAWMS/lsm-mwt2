@@ -1,0 +1,229 @@
+#!/usr/bin/env python
+
+# lsm-rm: Remote a file from a storage endpoint
+# 
+# lsm-rm [-p protocol] [-t token] file
+#
+# lsm-rm [--protocol protocol] [--token token] file
+
+# Valid transport protocols are
+#
+#  GFAL_srm	SRM using gfal-rm
+#  LCG_srm	SRM using lcg-del
+#
+#
+####################################################################################################
+
+
+import sys, os, stat, time
+import optparse
+
+from socket    import gethostname
+from datetime  import datetime
+from lsm       import *
+import lsm
+
+
+# Transfer protocols which are available to use
+tpAvailable  = [ 'GFAL_srm', 'LCG_srm' ]
+
+# Default list of protocols to use
+DEFtpList    = [ 'GFAL_srm' ]
+
+
+# Transfer protocol commands
+tpCMD = {}
+
+
+# The LSM logfile
+lsm.LOGFILE       = '/var/log/lsm/lsm-rm.log'
+
+
+####################################################################################################
+
+
+# Initialize
+token        = None
+protocol     = None
+
+
+# Announce the command we were invoked with
+info(  1,'lsm-rm %s invoked as: %s' % ( lsmversion, ' '.join(sys.argv)) )
+
+usage = "Usage: %prog [--protocol protocol][--token token] endpoint"
+parser = optparse.OptionParser(usage)
+parser.add_option("-p",  "--protocol",  action="append",     type="string",  dest="Protocol",
+                  help="Protocol")
+parser.add_option("-t",  "--token",     action="store",      type="string",  dest="Token",
+                  help="Space Token")
+parser.add_option("-v", "--verbose",    action="store_true", dest="Verbose",
+                  help="Turn on verbosity")
+(options, args) = parser.parse_args()
+
+
+
+# Get the verbosity
+verbose = options.Verbose
+
+if ( verbose ) : info( 11," Verbosity enabled")
+
+
+# Fetch the Protocol list
+if ( options.Protocol == None ) :
+  tpList = DEFtpList
+else :
+  tpList = options.Protocol
+
+# Fetch the Space Token name
+if ( options.Token == None ) :
+  token  = None
+else :
+  token  = options.Token
+
+
+# Make certain we only have a storage endpoint
+if ( len(args) != 1 ) :
+  error(212, "Invalid command, only a single storage endpoint must be specified")
+  exitToPilot(212)
+
+
+# Initialze the transport protocol command list to None
+for tp in tpList :
+  if (tp in tpAvailable) : 
+    tpCMD[tp] = [ None, None ]
+  else :
+    error(210,"Invalid command, unknown transport protocol specified: %s" % tp)
+    exitToPilot(210)
+
+
+####################################################################################################
+
+
+# Split out the SRC
+src_url = args[0]
+
+# Extract the protocol and host we are wanting to get information
+src_protocol = src_url.split('/')[0]
+src_host     = src_url.split('/')[2]
+
+# We only support the SRM protocol
+if ( src_protocol == 'srm:' ):
+  info( 2,"Transfer protocol: %s" % src_protocol.split(':')[0])
+else :
+  error(214,"Invalid command, SRC must begin with 'srm://'")
+  exitToPilot(214)
+
+
+
+# Make certain all timeout values are integers and force a round up to the nearest second
+tmoConnect          = int( tmoConnect  + 0.99 )
+tmoTransfer         = int( tmoTransfer + 0.99 )
+tmoTotal            = int( tmoConnect + tmoTransfer )
+tmoCMD              = int( tmoConnect + tmoTransfer )
+
+# TMO for GFAL transfers
+gfalsrmTMO_Total     = int( tmoTotal    )
+gfalsrmTMO_CMD       = int( tmoTotal    )
+
+# TMO for LCG transfers
+lcgsrmTMO_Connect   = int( tmoConnect  )
+lcgsrmTMO_SRM       = int( tmoTransfer )
+lcgsrmTMO_Transfer  = int( tmoTransfer )
+lcgsrmTMO_CMD       = int( tmoTransfer )
+
+
+####################################################################################################
+
+
+# The transfer command for each transfer protocol
+gfalsrmCMD           = 'gfal-rm --timeout %s --recursive %s'                                                                                             % ( gfalsrmTMO_Total,   src_url)
+lcgsrmCMD           = 'lcg-del --nobdii --nolfc --connect-timeout %s --srm-timeout %s --sendreceive-timeout %s --defaultsetype srmv2 --setype srmv2 %s' % ( lcgsrmTMO_Connect, lcgsrmTMO_SRM, lcgsrmTMO_Transfer, src_url )
+
+
+# GFAL2 using SRM protocol
+tpCMD['GFAL_srm'] = [ gfalsrmCMD, gfalsrmTMO_CMD ]
+
+# LCG using SRM protocol
+tpCMD['LCG_srm'] = [ lcgsrmCMD, lcgsrmTMO_CMD ]
+
+
+# Start with a failure
+exit_status = 255
+
+# Try to transfer the protocol using every protocol listed
+for tp in tpList :
+
+  # Extract the pcache and transfer command from the ntuple
+  tpC = tpCMD[tp][0]
+  tpT = tpCMD[tp][1]
+
+  # Do we have both a pcache and transfer command
+  if ( (tpC == None) ) :
+    warn( 56, "Ignoring transfer protocol %s because there is no available command" % ( tp ) )
+  else :
+
+    info(  2, "Transfer protocol: %s" % tp)
+    info(  7, "Transfer command : %s" % tpC)
+
+    # Initialize the ES Payload
+    esPayload['protocol']    = tp
+    esPayload['command']     = tpC
+
+    if ( token == None ) :
+      esPayload['token']     = 'None'
+    else :
+      esPayload['token']     = token
+
+    esPayload['start']       = datetime.utcnow().isoformat()
+
+
+    # Attempt the deletion with a timeout
+    exit_status, cmd_output = RunCMD(tpC, tpT)
+
+    # Stop the timer for ES
+    esPayload['end'] = datetime.utcnow().isoformat()
+
+    # Did the command execute
+    if ( exit_status == 0 ) : 
+
+      # GFAL will return a 0 even if the file does not exist
+      if ( tp == 'GFAL_srm') :
+        gfal_file, gfal_status = cmd_output.split()
+
+        # Rewrite the exit status depending on the file
+        if   ( gfal_status == 'DELETED' ) :
+          exit_status = 0 
+        elif ( gfal_status == "MISSING" ) :
+          exit_status = -1
+
+
+    # Did the removal succeed
+    if ( exit_status == 0 ) :
+
+      info( 12,"Removed file at %s" % src_url )
+
+      # Finish the ES payload and send to Kibana
+      esPayload['status'] = 'Success'
+      sendToES('rm')
+
+      break
+
+    else :
+
+      warn( 50, "Transfer command failed with exit status %s" % exit_status)
+
+      # Finish the ES payload and send to Kibana
+      esPayload['status'] = 'Fail'
+      esPayload['error']  = 'Transport protocol status: %s' % exit_status
+      sendToES('rm')
+
+
+
+# Did we get any free space
+if ( exit_status > 0 ) : 
+  error(255, "All transfer commands failed")
+  exitToPilot(255)
+
+
+# Exit with the Pilot return code
+exitToPilot(0)

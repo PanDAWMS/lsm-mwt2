@@ -1,0 +1,727 @@
+#!/usr/bin/env python
+
+# lsm-get: Retrieve files from a storage endpoint to local disk
+# 
+# lsm-get [-p protocol] [-t token] [-s N] [-c csum] [-g guid] src dst
+#
+# lsm-get [--protocol protocol] [--token token] [--size N] [--checksum csum] [--guid guid] src dst
+
+# Valid transport protocols are
+#
+#  XRD		XrootD using xrdcp via local door
+#  XRD_fax	XrootD using xrdcp via FAX
+#  GFAL_xrd	XrootD using gfal-copy via local door
+#  GFAL_fax	XrootD using gfal-copy via FAX
+#  GFAL_srm	SRM using gfal-copy
+#  LCG_srm	SRM using lcg-cp
+#  Default	SURL as passed by Panda using gfal-copy
+#
+#
+####################################################################################################
+
+
+import sys, os, stat, time
+import optparse
+import shlex
+
+from socket    import gethostname
+from datetime  import datetime
+from pcache    import *
+from lsm       import *
+import lsm
+
+
+# Transfer protocols which are available to use
+tpAvailable  = [ 'GFAL_xrd', 'GFAL_srm', 'GFAL_fax', 'XRD_fax', 'XRD', 'LCG_srm', 'Default' ]
+
+# Default list of protocols to use
+DEFtpList  = [ 'GFAL_xrd', 'GFAL_srm', 'XRD', 'XRD_fax' ]
+
+
+# Transfer protocol commands
+tpCMD = {}
+
+
+# The LSM logfile
+lsm.LOGFILE       = '/var/log/lsm/lsm-get.log'
+
+
+####################################################################################################
+#
+# do_transfer exit_status codes
+#
+#    0 - File was transferred correctly
+#    1 - File was in the cache and is ready
+#    2 - File was transferred but required retries (number in copy_status)
+#
+#   50 - Transfer command failed with copy status %s
+#   51 - Transfer command timeout
+#   52 - Transfer command exited successfully but destination file does not exist
+#   53 - Size mismatch %s!=%s
+#   54 - Checksum %s failed with: %s
+#   55 - Checksum mismatch %s!=%s
+#   60 - Transfer command not found
+#
+#  200 - Internal pCache error (return in copy_status)
+#
+####################################################################################################
+
+
+# Execute the given transfer command
+
+def do_transfer(cmd) :
+  
+  # Prep the command for pCache
+  pcache_cmd = shlex.split(cmd)
+
+  # Setup pCache
+  pcache = Pcache()
+
+  # Execute the copy command inside a timer
+  t = Timer()
+
+  # Execute the copy command in pCache capturing any output
+  with Capturing() as copy_output :
+    exit_status, copy_status = pcache.main(pcache_cmd)
+
+  # If there is any output, send each line to the log
+  if (copy_output) : 
+    for output in copy_output :
+      if ( output.strip() == '' ) :
+        pass
+      else :
+        info( 10, "Transfer   output: '%s'" % output )
+
+
+  # Is the file available
+  #
+  # 0 File was transferred successfully, cached and linked
+  # 1 File was in the cache and is available
+  # 2 File was transferred successfully but needed retries (copy_status has the retry count)
+  # 3 Transfer command failed (copy_status has the transfer return code)
+  # 4 Transfer command timed out
+  # 5 Transfer command was not found
+
+  # Transfer succeeded
+  if   ( exit_status == 0 ) :
+    info(  4,"Transfer took %s seconds for a %s byte file,  %.2f b/s" % (t,size, size/float(t)) )
+
+  # File was in the cache, no transfer needed
+  elif ( exit_status == 1 ) :
+    info(  6,"Cached %s byte file" % size)
+
+  # File transferred successfully but needed retries
+  elif ( exit_status == 2 ) :
+    info(  8,"Transfer was successful after %s retries" % copy_status )
+    info(  4,"Transfer took %s seconds for a %s byte file,  %.2f b/s" % (t,size, size/float(t)) )
+
+  # Transfer command failed
+  elif ( exit_status == 3 ) :
+
+    # Remove any stubs of a file
+    if ( os.path.exists(dst_filepath) ) :
+      try:
+        os.unlink(dst_filepath)
+      except:
+        pass
+
+    warn( 50, "Transfer command failed with copy status %s" % copy_status)
+    return ( 50, copy_status, None)
+
+  # Transfer command timed out
+  elif ( exit_status == 4 ) :
+
+    # Remove any stubs of a file
+    if ( os.path.exists(dst_filepath) ) :
+      try:
+        os.unlink(dst_filepath)
+      except:
+        pass
+
+    warn( 51, "Transfer command timed out")
+    return ( 51, None, None)
+
+  # Transfer command was not found
+  elif ( exit_status == 5 ) :
+
+    # Remove any stubs of a file
+    if ( os.path.exists(dst_filepath) ) :
+      try:
+        os.unlink(dst_filepath)
+      except:
+        pass
+
+    warn( 60, "Transfer command was not found")
+    return ( 60, None, None)
+
+
+  # We should never get here as the only valid returns from pCache are 0 thru 5
+  else :
+
+    # Remove any stubs of a file
+    if ( os.path.exists(dst_filepath) ) :
+      try:
+        os.unlink(dst_filepath)
+      except:
+        pass
+
+    error(200, "Internal pCache error: %s" % exit_status)
+    return(200, exit_status, None)
+
+
+  # pCache successully got us a file, but we are not done yet....
+
+  # But do we have a file in the correct location
+  if (not os.path.exists(dst_filepath)) :
+    warn( 52,"Transfer command exited successfully but destination file does not exist")
+    return ( 52, None, None)
+
+  # Try to fix the permission 
+  try :
+    os.chmod(dst_filepath, permFile)
+  except :
+    pass
+
+  # Verify the size if asked for
+  if (size) :
+    try :
+      fsize = os.stat(dst_filepath)[stat.ST_SIZE]
+    except :
+      fsize = "UNKNOWN"
+
+    # Does the size match
+    if (size != fsize) :
+      warn( 53, "Size mismatch %s!=%s"%(fsize,size))
+      return ( 53, None, None)
+
+  # Verify the checksum if asked for
+  if (checksumval):
+
+    t = Timer()
+
+    try :
+      fchecksumval = checksumfunc(dst_filepath)
+      info(  5,"Local checksum took %s seconds for %s byte file,  %.2f b/s" % (t,fsize, fsize/float(t)) )
+
+    except Exception, e :
+      fchecksumval = "UNKNOWN"
+      warn( 54, "Checksum %s failed with: %s" % (checksumfunc, e) )
+      return ( 54, None, None)
+
+    if (fchecksumval != checksumval) :
+      warn( 55, "Checksum mismatch %s!=%s" % (fchecksumval, checksumval) )
+      return ( 55, None, None)
+
+
+  # If we got here, the transfer was successful
+  return (exit_status, None, size)
+        
+
+####################################################################################################
+
+
+# Initialize
+token        = None
+size         = None
+checksumtype = None
+checksumval  = None
+guid         = None
+
+
+# Announce the command we were invoked with
+info(  1,'lsm-get %s invoked as: %s' % ( lsmversion, ' '.join(sys.argv)) )
+
+usage = "Usage: %prog [--protocol protocol][--token token][--size N][--checksum csum][--guid guid] src dst"
+parser = optparse.OptionParser(usage)
+parser.add_option("-p",  "--protocol",  action="append",     type="string",  dest="Protocol",
+                  help="Protocol")
+parser.add_option("-t",  "--token",     action="store",      type="string",  dest="Token",
+                  help="Space Token")
+parser.add_option("-s",  "--size",      action="store",      type="int",     dest="Size",
+                  help="Expected size of the file")
+parser.add_option("-c",  "--checksum",  action="store",      type="string",  dest="Checksum",
+                  help="Expected checksum of the file")
+parser.add_option("-g",  "--guid",      action="store",      type="string",  dest="GUID",
+                  help="GUID of the file")
+parser.add_option("-v", "--verbose",    action="store_true", dest="Verbose",
+                  help="Turn on verbosity")
+(options, args) = parser.parse_args()
+
+
+# Get the verbosity
+verbose = options.Verbose
+
+if ( verbose ) : info( 11," Verbosity enabled")
+
+
+# Fetch the Protocol list
+if ( options.Protocol == None ) :
+  tpList = DEFtpList
+else :
+  tpList = options.Protocol
+
+# Initialze the transport protocol command list to None
+for tp in tpList :
+  if (tp in tpAvailable) : 
+    tpCMD[tp] = [ None, None ]
+  else :
+    error(210,"Invalid command, unknown transport protocol specified: %s" % tp)
+    exitToPilot(210, "Invalid command, unknown transport protocol specified: %s" % tp)
+
+
+# Fetch the Space Token name
+if ( options.Token == None ) :
+  token  = None
+else :
+  token  = options.Token
+
+
+# Fetch the Size
+if ( options.Size == None ) : 
+  size  = None
+else : 
+  size  = options.Size
+
+  if ( size <= 0 ) :
+    error(209, "Invalid command, invalid size specified")
+    exitToPilot(209, "Invalid command, invalid size specified")
+
+
+# Fetch the GUID
+if ( options.GUID == None ) : 
+  guid  = None
+else : 
+  guid  = options.GUID
+
+
+# Fetch the checksum
+if ( options.Checksum == None ) : 
+  checksumtype = None
+  checksumval  = None
+else : 
+  val  = options.Checksum
+
+  if ( ':' in val ) :
+    checksumtype, checksumval = val.split(':')
+  else :
+    checksumtype = "md5"
+    checksumval  = val
+
+  checksumval  = checksumval.lower()
+  
+  if   ( checksumtype.startswith('md5') )     :
+    checksumfunc = md5sum
+  elif ( checksumtype.startswith('adler32') ) :
+    checksumfunc = adler32
+  else:
+    error(203, "Unsupported checksum type: %s" % checksumtype)
+    exitToPilot(203, "Unsupported checksum type: %s" % checksumtype)
+
+
+
+# Make certain we only have a SRC and DST
+if ( len(args) != 2 ) :
+  error(202, "Invalid command, needs at least SRC and DST")
+  exitToPilot(202, "Invalid command, needs at least SRC and DST")
+
+
+####################################################################################################
+
+
+# Split out the SRC and DST
+src_url, dst_url = args
+
+# We are expecting a string of the form (srm: can also be httpg:)
+#
+#       srm:://hostname:port/srm/managerv2?SFN=
+#       srm:://hostname:port/srm/v2/server?SFN=
+
+# String must start with SRM
+if   ( not src_url.startswith('srm://') ) :
+  error(214,"Invalid command, SRC must begin with 'srm://'")
+  exitToPilot(214, "Invalid command, SRC must begin with 'srm://'")
+
+
+# Find the SFN_ROOT in the string
+index = src_url.find(SFN_ROOT)
+
+# String must contain a SFN_ROOT
+if ( index >= 0 ) :
+  src = src_url[index:]
+else:
+  error(201, "Invalid command, SFN_ROOT %s not found" % SFN_ROOT)
+  exitToPilot(201, "Invalid command, SFN_ROOT %s not found" % SFN_ROOT)
+
+
+# Split into the host and file path
+src_hostpath, src_filepath = src_url[len('srm:'):].split(SFN_ROOT)
+
+if ( src_filepath.endswith('/') ) :
+  error(219, "Invalid command, source must end in a file name")
+  exitToPilot(219, "Invalid command, source must end in a file name")
+
+
+# Now split the source into a path and filename
+src_pathname, src_filename = os.path.split(src_filepath)
+
+# Extract the hostname with the port
+src_hostport = src_hostpath.split('/')[2]
+
+# Extract the remainder as the service manager (+2 accounts for leading //)
+src_service = src_hostpath[(len(src_hostport)+2):]
+
+
+
+
+
+# Find the RUCIO_ROOT in the file path
+index = src_filepath.find(RUCIO_ROOT)
+
+# If this is a Rucio path, construct a gLFN for FAX
+if ( index < 0 ) :
+  src_gLFN = None
+
+else :
+  src_gLFN = src_filepath[index:].split('/',5)
+
+  # group and user paths have an extra directory we need to account for
+  if ( (src_gLFN[2] == 'group') or (src_gLFN[2] == 'user') ) :
+    src_gLFN = src_filepath[index:].split('/',6)
+    src_gLFN = '%s%s/%s/%s:%s' % ( FAX_ROOT, RUCIO_ROOT, src_gLFN[2], src_gLFN[3], src_gLFN[6] )
+  else :
+    src_gLFN = '%s%s/%s:%s' % ( FAX_ROOT, RUCIO_ROOT, src_gLFN[2], src_gLFN[5] )
+
+
+
+# If destination starts withh file:, remove it
+if ( dst_url.startswith('file:') ) :
+  dst_filepath = dst_url.split('file:')[1]
+else :
+  dst_filepath = dst_url
+
+# If the destination is a directory, make certain it ends with a /
+if ( os.path.isdir(dst_filepath) and (not dst_filepath.endswith('/')) ) : dst_filepath += '/'
+
+# If the destination does not have a file name, append the source file name to the destination
+if ( dst_filepath.endswith('/') ) : dst_filepath += src_filename
+
+# Now split the destination into a path and filename
+dst_pathname, dst_filename = os.path.split(dst_filepath)
+
+
+
+# Check to see if this file already exists
+
+if ( os.path.isfile(dst_filepath) ) :
+
+  # Were we given a size to compare against
+  fsize = None
+
+  if ( size ) :
+    try:
+      fsize = os.stat(dst_filepath)[stat.ST_SIZE]
+    except:
+      fsize = "UNKNOWN"
+
+
+  # Were we given a checksum to compare against
+  fchecksumval = None
+
+  if ( checksumval ) :
+    t = Timer()
+
+    try :
+      fchecksumval = checksumfunc(dst_filepath)
+      info(  5,"Local checksum took %s seconds for %s byte file,  %.2f b/s" % (t,fsize, fsize/float(t)) )
+
+    except Exception, e :
+      fchecksumval = "UNKNOWN"
+      error(208, "Checksum %s failed with: %s" % (checksumfunc, e) )
+      exitToPilot(208, "Checksum %s failed with: %s" % (checksumfunc, e))
+
+  if   ( fchecksumval != checksumval ) :
+    error(204, "File exists but with a different checksum: %s, checksum: %s != %s" % (dst_filepath, fchecksumval, checksumval))
+    exitToPilot(204, "File exists but with a different checksum: %s, checksum: %s != %s" % (dst_filepath, fchecksumval, checksumval))
+  elif ( fsize != size ) :
+    error(205, "File exists but with a different size: %s size:%s != %s" % (dst_filepath, fsize, size ))
+    exitToPilot(205, "File exists but with a different size: %s size:%s != %s" % (dst_filepath, fsize, size ))
+  else:
+    error(206, "File exists and is identical to source: %s" % dst_filepath)
+    exitToPilot(206, "File exists and is identical to source: %s" % dst_filepath)
+
+
+
+# Make certain the destination path exists
+if ( not os.path.exists(dst_pathname) ) :
+  try:
+    os.makedirs(dst_pathname,permDIR)
+  except:
+    pass
+
+# If it is still not there, we have a problem Houston
+if ( not os.path.exists(dst_pathname) ) :
+  error(207, "Cannot create output directory: %s" % dst_path)
+  exitToPilot(207, "Cannot create output directory: %s" % dst_path)
+    
+
+
+# ReCompute the Transfer timeout value based on the file size
+
+if ( size ) :
+
+  # Number of byte in MB
+  bytesMB = 1024 * 1024
+
+  # Get the size of the file in MB rounded up
+  sizeMB = int((size + bytesMB -1)/ bytesMB)
+
+  # Change the transfer timeout to by a mulitple of 
+  tmoTransfer = int(sizeMB * tmoPerMB)
+
+
+# Make certain the transfer timeout is at least at the minimum
+if (tmoTransfer < tmoMinTransfer) : tmoTransfer = tmoMinTransfer
+
+# Make certain all timeout values are integers and force a round up to the nearest second
+tmoConnect          = int( tmoConnect  + 0.99 )
+tmoTransfer         = int( tmoTransfer + 0.99 )
+tmoTotal            = int( tmoConnect + tmoTransfer )
+
+# TMO for GFAL transfers
+gfalsrmTMO_Total    = int( tmoTotal    )
+gfalsrmTMO_Transfer = int( tmoTransfer )
+gfalxrdTMO_Total    = int( tmoTotal    )
+gfalxrdTMO_Transfer = int( tmoTransfer )
+gfalfaxTMO_Total    = int( tmoTotal * tmoFAXmultiplier )
+gfalfaxTMO_Transfer = int( tmoTotal * tmoFAXmultiplier )
+
+# TMO for LCG transfers
+lcgTMO_Connect      = int( tmoConnect  )
+lcgTMO_SRM          = int( tmoTransfer )
+lcgTMO_Transfer     = int( tmoTransfer )
+
+# pCache TMO is the total transfer timeout plus a fudge
+pcacheTMO           = int( tmoTotal + pcacheTMOfudge )
+
+# pCache timers by protocol
+pcacheTMO_gfalsrm   = int( pcacheTMO )
+pcacheTMO_gfalxrd   = int( pcacheTMO )
+pcacheTMO_gfalfax   = int( pcacheTMO * tmoFAXmultiplier )
+pcacheTMO_xrd       = int( pcacheTMO )
+pcacheTMO_xrdfax    = int( pcacheTMO * tmoFAXmultiplier )
+pcacheTMO_lcgsrm    = int( pcacheTMO )
+pcacheTMO_dccp      = int( pcacheTMO )
+
+
+
+# Base pCache command common to all transport protocols
+cmd_pcache = "%s -m %s -r %s" % ( pcacheEXE, pcacheMaxSpace, pcacheRetries )
+
+# Do we have Panda Caching enabled
+if ( pandaCache ) :
+  cmd_pcache = "%s -P -S %s" % ( cmd_pcache, pandaSiteName )
+
+  # If we have a guid add that for the pCache call
+  if guid : 
+    cmd_pcache = "%s -g %s" % ( cmd_pcache, guid )
+
+
+# The pCache command for each transport protocol
+cmd_pcache_gfalsrm  = "%s -t %s" % ( cmd_pcache, pcacheTMO_gfalsrm  )
+cmd_pcache_gfalxrd  = "%s -t %s" % ( cmd_pcache, pcacheTMO_gfalxrd  )
+cmd_pcache_gfalfax  = "%s -t %s" % ( cmd_pcache, pcacheTMO_gfalfax  )
+cmd_pcache_xrd      = "%s -t %s" % ( cmd_pcache, pcacheTMO_xrd      )
+cmd_pcache_xrdfax   = "%s -t %s" % ( cmd_pcache, pcacheTMO_xrdfax   )
+cmd_pcache_lcgsrm   = "%s -t %s" % ( cmd_pcache, pcacheTMO_lcgsrm   )
+
+
+
+# The transfer command for each transfer protocol
+cmd_gfalsrm  = "gfal-copy --timeout %s --transfer-timeout %s"        % ( gfalsrmTMO_Total, gfalsrmTMO_Transfer )
+cmd_gfalxrd  = "gfal-copy --timeout %s --transfer-timeout %s"        % ( gfalxrdTMO_Total, gfalxrdTMO_Transfer )
+cmd_gfalfax  = "gfal-copy --timeout %s --transfer-timeout %s"        % ( gfalfaxTMO_Total, gfalfaxTMO_Transfer )
+cmd_xrd      = "xrdcp --nopbar"
+cmd_xrdfax   = "xrdcp --nopbar"
+cmd_lcgsrm   = "lcg-cp --nobdii --srcsetype srmv2 --connect-timeout %s --srm-timeout %s --sendreceive-timeout %s" % ( lcgTMO_Connect, lcgTMO_SRM, lcgTMO_Transfer )
+
+
+
+
+# Build the complete transfer commands we might want to use
+
+
+
+# GFAL2 with the protocol in AGIS
+tpC = "%s %s file://%s"               % ( cmd_gfalsrm, src_url, dst_filepath )
+tpP = "%s --storage-root=%s/"         % ( cmd_pcache_gfalsrm, src_pathname )
+tpCMD['Default'] = [ tpP , tpC ]
+
+
+# GFAL2 using SRM protocol
+tpC = "%s srm:%s%s%s file://%s"       % ( cmd_gfalsrm, src_hostpath, SFN_ROOT, src_filepath, dst_filepath )
+tpP = "%s --storage-root=%s/"         % ( cmd_pcache_gfalsrm, src_pathname )
+tpCMD['GFAL_srm'] = [ tpP , tpC ]
+
+
+# GFAL2 using XROOT protocol
+tpC = "%s %s%s file://%s"             % ( cmd_gfalxrd, prefixXRD, src_filepath, dst_filepath )
+tpP = "%s --storage-root=%s/"         % ( cmd_pcache_gfalxrd, src_pathname )
+tpCMD['GFAL_xrd'] = [ tpP , tpC ]
+
+
+# GFAL2 using FAX protocol but only if we have a gLFN
+if ( src_gLFN ) :
+  tpC = "%s %s%s file://%s"           % ( cmd_gfalfax, prefixFAX, src_gLFN, dst_filepath )
+  tpP = "%s --storage-root=%s%s/"     % ( cmd_pcache_gfalfax, FAX_ROOT, RUCIO_ROOT )
+  tpCMD['GFAL_fax'] = [ tpP , tpC ]
+else :
+  tpCMD['GFAL_fax'] = [ None , None ]
+
+
+# XRDCP
+tpC = "%s %s%s %s"                    % ( cmd_xrd, prefixXRD, src_filepath, dst_filepath )
+tpP = "%s --storage-root=%s/"         % ( cmd_pcache_xrd, src_pathname )
+tpCMD['XRD'] = [ tpP , tpC ]
+
+
+# XRDCP using FAX protocol but only if we have a gLFN
+if ( src_gLFN ) :
+  tpC = "%s %s%s %s"                  % ( cmd_xrdfax, prefixFAX, src_gLFN, dst_filepath )
+  tpP = "%s --storage-root=%s%s/"     % ( cmd_pcache_xrdfax, FAX_ROOT, RUCIO_ROOT )
+  tpCMD['XRD_fax'] = [ tpP , tpC ]
+else :
+  tpCMD['XRD_fax'] = [ None , None ]
+
+
+# LCG using SRM2 protocol
+tpC = "%s srm:%s%s%s file://%s"       % ( cmd_lcgsrm, src_hostpath, SFN_ROOT, src_filepath, dst_filepath )
+tpP = "%s --storage-root=%s/"         % ( cmd_pcache_lcgsrm, src_pathname )
+tpCMD['LCG_srm'] = [ tpP , tpC ]
+
+
+
+# Start with a failure
+exit_status = 255
+
+# Try to transfer the protocol using every protocol listed
+for tp in tpList :
+
+  # Extract the pcache and transfer command from the ntuple
+  tpP = tpCMD[tp][0]
+  tpC = tpCMD[tp][1]
+
+  # Do we have both a pcache and transfer command
+  if ( (tpP == None) or (tpC == None) ) :
+    warn( 56, "Ignoring transfer protocol %s because there is no available command" % ( tp ) )
+  else :
+
+    info(  2, "Transfer protocol: %s" % tp)
+    info(  3, "pCache   command : %s" % tpP)
+    info(  7, "Transfer command : %s" % tpC)
+
+    # Build the command with pcache, redirecting stderr to stdin
+    cmd = "%s %s" % ( tpP, tpC)
+
+
+    # Initialize the ES Payload
+    if ( 'size'    in esPayload ) : del esPayload['size']
+    if ( 'cached'  in esPayload ) : del esPayload['cached']
+    if ( 'error'   in esPayload ) : del esPayload['error']
+
+    esPayload['pcacheversion'] = pcacheversion
+    esPayload['protocol']      = tp
+    esPayload['command']       = tpC
+
+    if ( token == None ) :
+      esPayload['token'] = 'None'
+    else :
+      esPayload['token'] = token
+
+    esPayload['start'] = datetime.utcnow().isoformat()
+
+
+    # Attempt the transfer
+    exit_status, copy_status, file_size = do_transfer(cmd)
+
+
+    # Stop the timer for ES
+    esPayload['end'] = datetime.utcnow().isoformat()
+
+
+
+
+    #   0 - File was transferred correctly
+    #   1 - File was in the cache and is ready
+    #   2 - File was transferred but required retries (number of retries in copy_status)
+    #
+    #   50 - Transfer command failed (copy_status contains the error code)
+    #   51 - Transfer command timeout
+    #   52 - Transfer command exited successfully but destination file does not exist
+    #   53 - File Size mismatch
+    #   54 - Unable to checksum the file
+    #   55 - Checksum mismatch
+    #   60 - Transfer command not found
+
+
+    if ( (exit_status == 0) or (exit_status == 1) or (exit_status == 2) ) :
+
+      info(  0,"Transfer command was successful")
+
+      # Finish the ES payload and send to Kibana
+      if   ( exit_status == 0 ) :
+        esPayload['status']   = 'Success'
+        esPayload['cached']   = 'False'
+      elif ( exit_status == 1 ) :
+        esPayload['status']   = 'Success'
+        esPayload['cached']   = 'True'
+        esPayload['protocol'] = 'Cached'
+      elif ( exit_status == 2 ) :
+        esPayload['status']   = 'Success on retry'
+        esPayload['cached']   = 'False'
+
+      esPayload['size']   = file_size
+
+      # Send payload to ES
+      sendToES('get')
+
+      break
+
+    else :
+
+      # Finish the ES payload and send to Kibana
+      esPayload['status']  = 'Fail'
+
+      if   ( exit_status == 50 ) :
+
+        if ((tp == 'GFAL_xrd') or (tp == 'GFAL_srm') or (tp == 'GFAL_fax')) :
+          esPayload['error'] = os.strerror(copy_status)
+        else :
+          esPayload['error'] = 'Transport protocol status: %s' % copy_status
+
+      elif ( exit_status == 51 ) :
+        esPayload['error'] = 'Transport protocol timeout'
+      elif ( exit_status == 52 ) :
+        esPayload['error'] = 'File does not exist after transfer'
+      elif ( exit_status == 53 ) :
+        esPayload['error'] = 'Incorrect file size'
+      elif ( exit_status == 54 ) :
+        esPayload['error'] = 'Failed to checksum the file'
+      elif ( exit_status == 55 ) :
+        esPayload['error'] = 'Incorrect checksum'
+      elif ( exit_status == 60 ) :
+        esPayload['error'] = 'Transfer command not found'
+      else :
+        esPayload['error'] = 'Unknown status code: %s' % exit_status
+
+      # Send payload to ES
+      sendToES('get')
+
+
+# If no protocol moved the file, then we failed
+if ( exit_status > 2 ) : 
+  error(255, "All transfer commands failed")
+  exitToPilot(exit_status, esPayload['error'])
+
+
+# Exit with the Pilot return code
+exitToPilot(exit_status)

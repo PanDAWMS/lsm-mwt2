@@ -1,0 +1,2 @@
+# Run the pCache cleaner every hour at 20 past
+20,40 * * * * root /usr/local/bin/pcache.py --clean

@@ -1,0 +1,858 @@
+#!/usr/bin/env python
+
+# lsm-get: Copy files from local disk to a storage endpoint
+# 
+# lsm-get [-p protocol] [-t token] [-s N] [-c csum] [-g guid] src dst
+#
+# lsm-get [--protocol protocol] [--token token] [--size N] [--checksum csum] [--guid guid] src dst
+
+# Valid transport protocols are
+#
+#  GFAL_srm	SRM using gfal-copy
+#  LCG_srm	SRM using lcg-cp
+#  Default	SURL as passed by Panda using gfal-copy
+#
+#
+####################################################################################################
+
+
+import sys, os, stat, time, errno
+import optparse
+import shlex
+
+from socket    import gethostname
+from datetime  import datetime
+from pcache    import *
+from lsm       import *
+import lsm
+
+
+# Transfer protocols which are available to use
+tpAvailable  = [ 'GFAL_srm', 'LCG_srm', 'Default' ]
+
+# Default list of protocols to use
+DEFtpList  = [ 'GFAL_srm' ]
+
+
+# Transfer protocol commands
+tpCMD = {}
+
+
+# Number of retries to PUT the file
+putRetries        = 3
+
+
+# The LSM logfile
+lsm.LOGFILE       = '/var/log/lsm/lsm-put.log'
+
+
+####################################################################################################
+
+# LCG - Fetch the checksum and size of a given file on a storage endpoint
+#
+# exit_status
+#
+#   0 - File found, checksum and size returned
+#   1 - File not found
+#   2 - File found, cannot determine the size
+#   3 - File found, cannot compute a checksum
+#   4 - We goofed
+
+def do_get_info_lcg(surl, csumtype='adler32') :
+
+  # Initialize the returns
+  size_val = None
+  csum_val = None
+
+  # The commands to fetch the list (with size) and checksum
+  cmd_ls   = 'lcg-ls --nobdii --defaultsetype srmv2 --setype srmv2 --connect-timeout %s --srm-timeout %s --sendreceive-timeout %s -l %s' % ( lcglsTMO_Connect,  lcglsTMO_SRM,  lcglsTMO_Transfer, surl )
+
+  # Get the checksum
+  exit_status, cmd_output = RunCMD(cmd_ls, lcglsTMO_CMD)
+
+  if ( exit_status == 0 ) :
+    cmd_output = cmd_output.split()
+    try :
+      size_val = int(cmd_output[4])
+    except :
+      return ( 2, None, None )
+
+    try :
+      i = cmd_output.index('Checksum:')
+      csum_val = cmd_output[i+1].lower()
+    except :
+      return ( 3, None, None )
+
+  else :
+    return ( 1, None, None )
+
+
+  # Should never get here
+  return ( 0, csum_val, size_val )
+
+
+####################################################################################################
+
+# GFAL - Fetch the checksum and size of a given file on a storage endpoint
+#
+# exit_status
+#
+#   0 - File found, checksum and size returned
+#   1 - File not found
+#   2 - File found, cannot determine the size
+#   3 - File found, cannot compute a checksum
+#   4 - We goofed
+
+def do_get_info_gfal(surl, csumtype='adler32') :
+
+  # Initialize the returns
+  size_val = None
+  csum_val = None
+
+  # The commands to fetch the list (with size) and checksum
+  cmd_ls   = 'gfal-ls --long --timeout %s %s' % ( gfallsTMO_Total,  surl )
+  cmd_csum = 'gfal-sum --timeout %s %s %s'    % ( gfalsumTMO_Total, surl, csumtype )
+
+  # Get the checksum
+  exit_status, cmd_output = RunCMD(cmd_ls, gfallsTMO_CMD)
+
+  if ( exit_status == 0 ) :
+    try :
+      size_val = int(cmd_output.split()[4])
+    except :
+      return ( 2, None, None )
+  else :
+    return ( 1, None, None )
+
+  # Get the checksum
+  exit_status, exit_output = RunCMD(cmd_csum, gfalsumTMO_CMD)
+
+  if ( exit_status == 0 ) :
+    csum_surl, csum_val = exit_output.split()
+    csum_val = csum_val.lower()
+    return ( 0, csum_val, size_val )
+  else :
+    return ( 3, None, size_val )   
+  
+
+  # Should never get here
+  return ( 4, None, None )
+
+
+####################################################################################################
+
+# Fetch the checksum and size of a given file on a storage endpoint using a given protocol
+#
+# exit_status
+#
+#   0 - File found, checksum and size returned
+#   1 - File not found
+#   2 - File found, cannot determine the size
+#   3 - File found, cannot compute a checksum
+#   4 - We goofed
+
+def do_get_info(protocol, surl, csumtype='adler32') :
+
+  if   ( protocol == 'GFAL_srm' ) :
+    return do_get_info_gfal(surl, csumtype)
+  elif ( protocol == 'LCG_srm' ) :
+    return do_get_info_lcg(surl, csumtype)
+
+  # Should never get here
+  return do_get_info_gfal(surl, csumtype)
+
+
+####################################################################################################
+
+# Verify a file exists at the given surl and has a matching checksum and size
+#
+# info_status = do_file_should_exist(protocol, surl, csumtype, csumval, sizeval)
+#
+#    0 - File exists and has a matching checksum and size
+#
+#   64 - Destination file exists but with a different checksum: %s, checksum: %s != %s
+#   65 - Destination file exists but with a different size: %s size:%s != %s
+#   66 - Destination file does not exist
+
+def do_file_should_exist(protocol, surl, csumtype, csumval, sizeval) :
+
+  # Using the given protocol, verify there is a file at the give surl
+  info_status, info_csumval, info_sizeval = do_get_info(protocol, surl, csumtype)
+
+  # The file should exist and the size and checksum match
+  if ( info_status == 0 ) :
+    if   ( info_csumval != csumval ) :
+      warn( 64, "Destination file exists but with a different checksum: %s, checksum: %s != %s" % (surl, info_csumval, csumval))
+      return ( 64 )
+    elif ( info_sizeval != sizeval ) :
+      warn( 65, "Destination file exists but with a different size: %s size:%s != %s" % (surl, info_sizeval, sizeval))
+      return ( 65 )
+
+    # Have a file with matching checksum and size
+    return ( 0 )
+
+  elif ( info_status == 1 ) :
+    warn( 66, "Destination file does not exist")
+    return ( 66 )
+
+  elif ( info_status == 2 ) :
+    warn( 65, "Destination file exists but with a different size: %s size:%s != %s" % (surl, info_sizeval, sizeval))
+    return ( 65 )
+
+  elif ( info_status == 3 ) :
+    warn( 64, "Destination file exists but with a different checksum: %s, checksum: %s != %s" % (surl, info_csumval, csumval))
+    return ( 64 )
+
+
+  # Should never get here
+  error(254,"Internal error")
+  exitToPilot(254, "Internal error")
+
+
+####################################################################################################
+
+# Verify a file does not exist at the given surl
+#
+# info_status = do_file_should_not_exist(protocol, surl, csumtype, csumval, sizeval)
+#
+#    0 - File does not exist
+#
+#  204 - File exists but with a different checksum: %s, checksum: %s != %s
+#  205 - File exists but with a different size: %s size:%s != %s
+#  206 - File exists and is identical to source: %s
+#
+
+def do_file_should_not_exist( protocol, surl, csumtype, csumval, sizeval ) :
+
+  # Using the given protocol, see if there is a file at the given surl
+  info_status, info_csumval, info_sizeval = do_get_info(protocol, surl, csumtype)
+
+  # Should not find a file there, but if we do compare the results
+  if   ( info_status == 1 ) :
+    return ( 0 )
+
+  elif ( info_status == 0 ) :
+    if   ( info_csumval != csumval ) :
+      error(204, "File exists but with a different checksum: %s, checksum: %s != %s" % (surl, info_csumval, csumval))
+      return (204)
+    elif ( info_sizeval != sizeval ) :
+      error(205, "File exists but with a different size: %s size:%s != %s" % (surl, info_sizeval, sizeval))
+      return (205)
+    else:
+      error(206, "File exists and is identical to source: %s" % surl)
+      return (206)
+
+  elif ( info_status == 2 ) :
+    error(205, "File exists but with a different size: %s size:%s != %s" % (surl, info_sizeval, sizeval))
+    return (205)
+
+  elif ( info_status == 3 ) :
+    error(204, "File exists but with a different checksum: %s, checksum: %s != %s" % (surl, info_csumval, csumval))
+    return (204)
+
+  # Should never get here
+  error(254,"Internal error")
+  exitToPilot(254, "Internal error")
+
+
+####################################################################################################
+
+# Execute the give transfer command with a timeout
+#
+# exit_status, arg = do_transfer(cmd, tmo)
+#
+#    0 - File was transferred correctly
+#    1 -
+#    2 - File was transferred but required retries (number of retries in arg)
+#
+#   50 - Transfer command failed (arg contains the error code)
+#   51 - Transfer command timeout
+#
+
+def do_transfer(cmd, tmo=0) :
+
+  retry = 0
+
+  while ( retry <= putRetries ) :
+
+    # Lets time the transfer
+    t = Timer()
+
+    # Attempt the transfer
+    exit_status, copy_output = RunCMD(cmd, tmo)
+
+    # If there is any output, send each line to the log
+    if (copy_output) :
+      for output in copy_output.split('\n') :
+        if ( output.strip() == '' ) :
+          pass
+        else :
+          info( 10, "Transfer   output: '%s'" % output )
+
+    # If a success, break out
+    if ( exit_status == 0 ) : break
+
+    # Failed, increment the retry count and try again
+    retry += 1
+
+    if ( retry <= putRetries ) : 
+      retry_sleep = 5 ** retry
+      info ( 13, "Sleeping %s seconds before the next retry" % retry_sleep )
+      time.sleep(retry_sleep)
+
+
+  # Handle the exit
+  if   ( exit_status == 0 ) :
+    if ( retry == 0 ) : 
+      info(  4,"Transfer took %s seconds for a %s byte file,  %.2f b/s" % (t,size, size/float(t)) )
+      return ( 0, 0 )
+    else :
+      info(  8,"Transfer was successful after %s retries" % retry )
+      info(  4,"Transfer took %s seconds for a %s byte file,  %.2f b/s" % (t,size, size/float(t)) )
+      return ( 2, retry )
+
+  elif ( exit_status == -1 ) :
+    warn( 51, "Transfer command timed out")
+    return ( 51, None )
+
+  else :
+    warn( 50, "Transfer command failed with copy status %s" % exit_status )
+    return ( 50, exit_status )
+
+
+  # Should never get here
+  return ( -1, None )
+
+
+####################################################################################################
+#
+
+def is_disk_full(protocol, surl, token, sizeval) :
+
+  # Build a command to delete using our own lsm-rm and the removal protocol matching the copy
+  if ( token == None ) :
+    cmd_lsmdf = 'lsm-df --protocol %s %s'            % ( protocol, surl)
+  else :
+    cmd_lsmdf = 'lsm-df --protocol %s --token %s %s' % ( protocol, token, surl)
+
+  lsmdf_status, copy_output = RunCMD(cmd_lsmdf)
+
+  # Did we get the freespace
+  if ( lsmdf_status == 0 ) :
+    
+    # Convert MB to bytes
+    fsizeval = int(copy_output) * 1024 * 1024
+
+    if ( sizeval < fsizeval ) :
+      return ( False )
+    else :
+      return ( True )
+
+  # Unable to get the size, so say there is enough room
+  return ( False )
+
+
+####################################################################################################
+#
+#
+# Remove a file using lsm-rm
+#
+
+def do_file_remove(protocol, surl, token) :
+
+  # Build a command to delete using our own lsm-rm and the removal protocol matching the copy
+  if ( token == None ) :
+    cmd_lsmrm = 'lsm-rm --protocol %s %s'            % ( tpD, surl)
+  else :
+    cmd_lsmrm = 'lsm-rm --protocol %s --token %s %s' % ( tpD, token, surl)
+
+  # Try to remove any stubs
+  lsmrm_status, copy_output = RunCMD(cmd_lsmrm)
+
+  # Ignore any errors, just report if we did remove it
+  if ( lsmrm_status == 0 ) :
+    info( 12,'Removed file at %s' % surl )
+
+  return ( lsmrm_status )
+
+
+####################################################################################################
+#
+# MAIN
+#
+####################################################################################################
+
+# Initialize
+token        = None
+size         = None
+checksumtype = None
+checksumval  = None
+guid         = None
+
+
+# Announce the command we were invoked with
+info(  1,'lsm-put %s invoked as: %s' % ( lsmversion, ' '.join(sys.argv)) )
+
+usage = "Usage: %prog [--protocol protocol][--token token][--size N][--checksum csum][--guid guid] src dst"
+parser = optparse.OptionParser(usage)
+parser.add_option("-p",  "--protocol",  action="append",     type="string",  dest="Protocol",
+                  help="Protocol")
+parser.add_option("-t",  "--token",     action="store",      type="string",  dest="Token",
+                  help="Space Token")
+parser.add_option("-s",  "--size",      action="store",      type="int",     dest="Size",
+                  help="Expected size of the file")
+parser.add_option("-c",  "--checksum",  action="store",      type="string",  dest="Checksum",
+                  help="Expected checksum of the file")
+parser.add_option("-g",  "--guid",      action="store",      type="string",  dest="GUID",
+                  help="GUID of the file")
+parser.add_option("-v", "--verbose",    action="store_true", dest="Verbose",
+                  help="Turn on verbosity")
+(options, args) = parser.parse_args()
+
+
+# Get the verbosity
+verbose = options.Verbose
+
+if ( verbose ) : info( 11," Verbosity enabled")
+
+
+# Fetch the Protocol list
+if ( options.Protocol == None ) :
+  tpList = DEFtpList
+else :
+  tpList = options.Protocol
+
+
+# Initialze the transport protocol command list to None
+for tp in tpList :
+  if (tp in tpAvailable) : 
+    tpCMD[tp] = [ None, None ]
+  else :
+    error(210,"Invalid command, unknown transport protocol specified: %s" % tp)
+    exitToPilot(210, "Invalid command, unknown transport protocol specified: %s" % tp)
+
+
+# Fetch the Space Token name
+if ( options.Token == None ) :
+  token  = None
+else :
+  token  = options.Token
+
+
+# Fetch the Size
+if ( options.Size == None ) : 
+  size  = None
+else : 
+  size  = options.Size
+
+  if ( size <= 0 ) :
+    error(209, "Invalid command, invalid size specified")
+    exitToPilot(209, "Invalid command, invalid size specified")
+
+
+# Fetch the GUID
+if ( options.GUID == None ) : 
+  guid  = None
+else : 
+  guid  = options.GUID
+
+
+# Fetch the checksum
+if ( options.Checksum == None ) : 
+  checksumtype = None
+  checksumfunc = None
+  checksumval  = None
+
+else : 
+  val  = options.Checksum
+
+  if ( ':' in val ) :
+    checksumtype, checksumval = val.split(':')
+  else :
+    checksumtype = "md5"
+    checksumval  = val
+
+  checksumval  = checksumval.lower()
+  
+  if   ( checksumtype.startswith('md5') )     :
+    checksumfunc = md5sum
+  elif ( checksumtype.startswith('adler32') ) :
+    checksumfunc = adler32
+  else:
+    error(203, "Unsupported checksum type: %s" % checksumtype)
+    exitToPilot(203, "Unsupported checksum type: %s" % checksumtype)
+
+
+
+# Make certain we only have a SRC and DST
+if ( len(args) != 2 ) :
+  error(202, "Invalid command, needs at least SRC and DST")
+  exitToPilot(202, "Invalid command, needs at least SRC and DST")
+
+
+####################################################################################################
+
+
+# ReCompute the Transfer timeout value based on the file size
+
+if ( size ) :
+
+  # Number of byte in MB
+  bytesMB = 1024 * 1024
+
+  # Get the size of the file in MB rounded up
+  sizeMB = int((size + bytesMB -1)/ bytesMB)
+
+  # Change the transfer timeout to by a mulitple of 
+  tmoTransfer = int(sizeMB * tmoPerMB)
+
+
+# Make certain the transfer timeout is at least at the minimum
+if (tmoTransfer < tmoMinTransfer) : tmoTransfer = tmoMinTransfer
+
+# Make certain all timeout values are integers and force a round up to the nearest second
+tmoConnect           = int( tmoConnect  + 0.99 )
+tmoTransfer          = int( tmoTransfer + 0.99 )
+tmoTotal             = int( tmoConnect + tmoTransfer )
+
+# TMO for GFAL transfers
+gfalsrmTMO_Transfer  = int( tmoTransfer )
+gfalsrmTMO_CMD       = int( tmoTotal    )
+gfalsrmTMO_Total     = int( tmoTotal    )
+gfallsTMO_CMD        = int( tmoTotal    )
+gfallsTMO_Total      = int( tmoTotal    )
+gfalsumTMO_CMD       = int( tmoTotal    )
+gfalsumTMO_Total     = int( tmoTotal    )
+
+# TMO for LCG transfers
+lcgsrmTMO_Connect   = int( tmoConnect  )
+lcgsrmTMO_SRM       = int( tmoTransfer )
+lcgsrmTMO_Transfer  = int( tmoTransfer )
+lcgsrmTMO_Total     = int( tmoTotal    )
+lcgsrmTMO_CMD       = int( tmoTotal    )
+lcglsTMO_Connect    = int( tmoConnect  )
+lcglsTMO_SRM        = int( tmoTransfer )
+lcglsTMO_Transfer   = int( tmoTransfer )
+lcglsTMO_Total      = int( tmoTotal    )
+lcglsTMO_CMD        = int( tmoTotal    )
+
+
+####################################################################################################
+
+
+# Split out the SRC and DST
+src_url, dest_url = args
+
+
+# If src has a file:, remove it
+if ( src_url.startswith('file:') ) :
+  src = src_url.split('file:')[1]
+else :
+  src = src_url
+
+
+
+# Make certain the source file exists
+if ( not os.path.isfile(src) ) :
+  error(215,"Source file does not exist: %s" % src )
+  exitToPilot(215, "Source file does not exist: %s" % src)
+
+# Now split the source into a path and filename
+dirname, filename = os.path.split(src)
+
+# If the dest does not have a file name, get it from the src and append it to the dest
+if ( dest_url.endswith('/') ) :
+    dest = '%s%s' % ( dest_url, filename )
+else :
+    dest = dest_url
+
+
+####################################################################################################
+
+# Compute the size and checksum of the source file
+# Compare to the values given by --size and --checksum
+#
+# If --size and/or --checksum were not given,
+# use the source file values for the destination
+# with a default of adler32 for checksum)
+
+
+# Fetch the size of the source file
+
+try:
+  fsize = os.stat(src)[stat.ST_SIZE]
+
+except:
+  fsize = "UNKNOWN"
+
+
+# If we were given a size, compare to the local size
+if ( size == None ) :
+  warn( 62,"Using source file size for destination: %s" % fsize )
+  size = fsize
+
+else :
+  if ( fsize != size ) :
+    error(216, "Source file %s has an incorrect size: %s != %s" % (src, fsize, size ))
+    exitToPilot(216, "Source file %s has an incorrect size: %s != %s" % (src, fsize, size ))
+
+
+
+# If --checksum was not given, default to alder32
+if ( checksumtype == None ) :
+  checksumtype = 'adler32'
+  checksumfunc =  adler32
+
+
+# Compute the checksum of the source file
+t = Timer()
+
+try :
+  fchecksumval = checksumfunc(src)
+  info(  5,"Local checksum took %s seconds for %s byte file,  %.2f b/s" % (t,fsize, fsize/float(t)) )
+
+except Exception, e :
+  fchecksumval = "UNKNOWN"
+
+
+# If we were given a checksum, compare to the local checksum
+if ( checksumval == None ) :
+  warn( 63,"Using source file checksum for destination: %s" % fchecksumval )
+  checksumtype = 'adler32'
+  checksumfunc =  adler32
+  checksumval  = fchecksumval
+
+else :
+  if ( fchecksumval != checksumval ) :
+    error(217, "Source file %s has an incorrect checksum: %s != %s" % ( src, fchecksumval, checksumval ) )
+    exitToPilot(217, "Source file %s has an incorrect checksum: %s != %s" % ( src, fchecksumval, checksumval ))
+
+
+####################################################################################################
+
+# The transfer command for each transfer protocol
+cmd_gfalsrm = "gfal-copy --timeout %s --transfer-timeout %s -D \"SRM PLUGIN:TURL_PROTOCOLS=gsiftp\""              % ( gfalsrmTMO_Total, gfalsrmTMO_Transfer )
+cmd_lcgsrm  = "lcg-cp --nobdii --connect-timeout %s --srm-timeout %s --sendreceive-timeout %s --dstsetype srmv2"  % ( lcgsrmTMO_Connect,  lcgsrmTMO_SRM,  lcgsrmTMO_Transfer  )
+
+
+# If a space token was given, use it in the transfer
+if ( token != None ) :
+  cmd_gfalsrm  = "%s --dst-spacetoken %s" % ( cmd_gfalsrm, token )
+  cmd_lcgsrm   = "%s --dst %s"            % ( cmd_lcgsrm,  token ) 
+
+
+
+# Build the complete transfer commands we might want to use
+
+# GFAL2 with the protocol in AGIS
+tpC = "%s %s %s"                    % ( cmd_gfalsrm, src_url, dest_url )
+tpCMD['Default'] = [ tpC , gfalsrmTMO_CMD, 'GFAL_srm' ]
+
+
+# GFAL2 using SRM protocol
+tpC = "%s file://%s %s"             % ( cmd_gfalsrm, src, dest )
+tpCMD['GFAL_srm'] = [ tpC , gfalsrmTMO_CMD, 'GFAL_srm' ]
+
+
+# LCG using SRM2 protocol
+tpC = "%s file://%s %s"             % ( cmd_lcgsrm, src, dest )
+tpCMD['LCG_srm'] = [ tpC , lcgsrmTMO_CMD, 'LCG_srm' ]
+
+
+
+
+# Start with a failure
+exit_status = 255
+
+# Try to transfer the protocol using every protocol listed
+for tp in tpList :
+
+  # Extract the transfer command, timeout and deletion protocol
+  tpC = tpCMD[tp][0]
+  tpT = tpCMD[tp][1]
+  tpD = tpCMD[tp][2]
+
+  # Do we have both a pcache and transfer command
+  if ( (tpC == None) ) :
+    warn( 56, "Ignoring transfer protocol %s because there is no available command" % ( tp ) )
+    break
+
+
+  info(  2, "Transfer protocol: %s" % tp)
+  info(  7, "Transfer command : %s" % tpC)
+
+
+  # Initialize the ES Payload
+  esPayload['start']         = datetime.utcnow().isoformat()
+
+  if ( 'size'    in esPayload ) : del esPayload['size']
+  if ( 'error'   in esPayload ) : del esPayload['error']
+
+  esPayload['protocol']      = tp
+  esPayload['command']       = tpC
+
+  if ( token == None ) :
+    esPayload['token']       = 'None'
+  else :
+    esPayload['token']       = token
+
+
+
+  # Using the protocol, make certain there is no file at the destination
+  info_status = do_file_should_not_exist(tp, dest, checksumtype, checksumval, size)
+
+  # File should not exist
+  if ( info_status != 0 ) :
+
+    # Finish the ES payload and send to Kibana
+    esPayload['status']  = 'Fail'
+
+    if   ( info_status == 204 ) :
+      esPayload['error'] = 'File exists but with a different checksum'
+    elif ( info_status == 205 ) :
+      esPayload['error'] = 'File exists but with a different size'
+    elif ( info_status == 206 ) :
+      esPayload['error'] = 'File exists and is identical to source'
+    else :
+      esPayload['error'] = 'Internal error'
+
+    esPayload['end'] = datetime.utcnow().isoformat()
+    sendToES('put')
+    exitToPilot(info_status, esPayload['error'])      
+
+
+  # See if there is enough free space to hold this file
+
+  if ( token != None ) :
+    if ( is_disk_full(tpD, dest, token, size) ) :
+      error( 218,"Destination does not have enough free space")
+      esPayload['error'] = 'Destination does not have enough free space'
+      esPayload['end']   = datetime.utcnow().isoformat()
+      sendToES('put')
+      exitToPilot(218, esPayload['error'])
+
+
+  # Attempt the transfer
+  exit_status, copy_status = do_transfer(tpC, tpT)
+
+  # Using the same protocol, see if the file exists
+  info_status = do_file_should_exist(tp, dest, checksumtype, checksumval, size)
+
+  # Payload is now complete
+  esPayload['end'] = datetime.utcnow().isoformat()
+
+
+  # Did the transfer command succeed
+  if ( (exit_status == 0) or (exit_status == 2) ) :
+
+    # If the file exists, complete and exit
+    if ( info_status == 0 ) :
+
+      info(  0,"Transfer command was successful")
+
+      # Finish the ES payload and send to Kibana
+      esPayload['size']   = size
+
+      if   ( exit_status == 0 ) :
+        esPayload['status'] = 'Success'
+      elif ( exit_status == 2 ) :
+        esPayload['status'] = 'Success on retry'
+
+      # Send the payload to ES
+      sendToES('put')
+
+      # Success - no other protocols to try
+      break
+
+    # Transfer succeeded, but the file does not exist or has a bad size/checksum
+    else :
+
+      # Finish the ES payload and send to Kibana
+      esPayload['status']  = 'Fail'
+
+      if   ( info_status == 64 ) :
+        esPayload['error'] = 'Destination file exists but with a different checksum'
+        exit_status = 204
+
+      elif ( info_status == 65 ) :
+        esPayload['error'] = 'Destination file exists but with a different size'
+        exit_status = 205
+
+      elif ( info_status == 66 ) :
+        esPayload['error'] = 'Destination file does not exist'
+        exit_status = 255
+
+      else :
+        esPayload['error'] = 'Internal error'
+        exit_status = 255
+
+      # Send the payload data to ES
+      sendToES('put')
+
+      # No sense trying again since the file is there
+      break
+
+
+  # Transfer of file failed
+  else :
+
+    # Finish the ES payload and send to Kibana
+    esPayload['status']  = 'Fail'
+
+    # But does the file exist at the destination
+    if   ( info_status == 0 ) :
+      esPayload['error'] = 'Destination file exists and is identical to source'
+      exit_status = 206
+
+    elif ( info_status == 64 ) :
+      esPayload['error'] = 'Destination file exists but with a different checksum'
+      exit_status = 204
+ 
+    elif ( info_status == 65 ) :
+      esPayload['error'] = 'Destination file exists but with a different size'
+      exit_status = 205
+
+    elif ( info_status == 66 ) :
+
+      # File still does not exist, so look at transfer error
+      if   ( exit_status == 50 ) :
+
+        if (tp == 'GFAL_srm') :
+          esPayload['error'] = os.strerror(copy_status)
+
+          # Rewrite some exit codes for the pilot
+          if (   copy_status == errno.EEXIST ) :
+            exit_status = 64
+          elif ( copy_status == errno.ETIMEDOUT ) :
+            exit_status = 51
+        else :
+          esPayload['error'] = 'Transport protocol status: %s' % copy_status
+
+      elif ( exit_status == 51 ) :
+        esPayload['error'] = 'Transport protocol timeout'
+
+      else :
+        esPayload['error'] = 'Unknown exit status code: %s' % exit_status
+        exit_status = 255
+
+    else :
+      esPayload['error'] = 'Unknown info status code: %s' % info_status
+      exit_status = 255
+
+    # Send the payload to ES
+    sendToES('put')
+
+
+# If no protocol moved the file, then we failed
+if ( exit_status > 2 ) : 
+  error(255, "All transfer commands failed")
+  exitToPilot(exit_status, esPayload['error'])
+
+else :
+  print '%s'      % dest_url
+  print 'size %s' % size
+  print '%s %s'   % ( checksumtype, checksumval ) 
+
+
+# Exit with the Pilot return code
+exitToPilot(exit_status)
