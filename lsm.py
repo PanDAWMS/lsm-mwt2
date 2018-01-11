@@ -4,7 +4,7 @@
 #
 
 # The LSM Version
-lsmversion="2.11.0"
+lsmversion = "3.00.1"
 
 ####################################################################################################
 #
@@ -107,7 +107,6 @@ lsmversion="2.11.0"
 #
 ####################################################################################################
 
-
 import sys, os, stat, time, syslog
 import zlib, hashlib
 import subprocess, signal
@@ -118,13 +117,9 @@ from cStringIO import StringIO
 from socket    import gethostname
 from datetime  import datetime
 
+from lsmsite   import *
+import lsmsite
 
-# Our site name
-siteName          = 'MWT2'
-
-
-# Default log file - scripts should override this
-LOGFILE='/tmp/lsm.out'
 
 # Build a session ID for the logs
 sessid="%s.%s" % ( int(time.time()), os.getpid() )
@@ -175,62 +170,15 @@ mapLSMtoPilot[ 255 ] = 201
 mapLSMtoPilot[ 999 ] = 255
 
 
-
-#Tunable parameters
-pcacheEXE        = "pcache.py"
-pcacheRetries    =    3
-pcacheTMO        = 1200.00
-pcacheTMOfudge   =   15.00
-pcacheMaxSpace   =  "80%"
-#pcacheMaxSpace   =  "10T"
-
-
-
-# Timeout values for transfers in seconds
-tmoConnect       =   30.00
-tmoTransfer      =  300.00
-tmoMinTransfer   =   30.00
-# Number of seconds to move a MB
-tmoPerMB         =    0.25
-tmoFAXmultiplier =    3
-
-# Permissions
-permDIR          = 0775
-permFile         = 0664
-
-
-# The MWT2 prefixes for the different protocols
-prefixXRD        = "root://xrddoor.mwt2.org:1096"
-prefixFAX        = "root://atlas-xrd-central.usatlas.org:1094"
-
-
-# Local path after the prefix for SRM
-SFN_ROOT         = '?SFN='
-
-# Local path after the prefix for FAX
-FAX_ROOT          = '//atlas'
-
-# Local path after the prefix for Rucio
-RUCIO_ROOT        = '/rucio'
-
-
-
-# Use Panda Caching and the Site (Queues) to manange
-pandaCache        = False
-pandaSiteName     = 'MWT2_SL6,MWT2_MCORE,ANALY_MWT2_SL6'
-
+####################################################################################################
 
 # Get host name (full and short)
 hostFQDN          = gethostname()
 hostName          = hostFQDN.split('.')[0]
 
 
-
-# Elastic Search monitoring
-enableES          = True
-
 # ElasticSearch Index - each script appends its "/type" such as "/get" or "/put"
-esIndexBase       = 'http://atlas-kibana.mwt2.org:9200/lsm-%s.%s' % ( str(datetime.utcnow().year), str(datetime.utcnow().month) )
+esIndexBase       = 'http://atlas-kibana.mwt2.org:9200/lsm_6_%s.%s' % ( str(datetime.utcnow().year), str(datetime.utcnow().month) )
 
 
 # Preload some fixed ElasticSearch values
@@ -538,7 +486,10 @@ def sendToES (type='none', tmo=15):
   if ( not enableES ) : return ( None )
 
   # Build the ES Index with a /type added
-  esIndex = '%s/%s' % ( esIndexBase, type )
+  esIndex = '%s/doc' % ( esIndexBase )
+
+  # Set the type of the record we are storing (get, put, df, rm)
+  esPayload['type'] = type
 
 
   # Try to send the payload to ES
